@@ -25,10 +25,15 @@ import (
 	"strings"
 )
 
+// The batch helpers in this file are driver-agnostic. They provide ordered
+// execution within one database/sql transaction only. When used with a Seata
+// driver, AT-specific behavior is provided by that driver and its executors.
+
 var (
-	errNilBatchDB      = errors.New("batch db is nil")
-	errNilBatchTx      = errors.New("batch tx is nil")
-	errEmptyBatchQuery = errors.New("batch query is empty")
+	errNilBatchDB            = errors.New("batch db is nil")
+	errNilBatchTx            = errors.New("batch tx is nil")
+	errEmptyBatchQuery       = errors.New("batch query is empty")
+	errInconsistentBatchArgs = errors.New("inconsistent batch argument count")
 )
 
 // batchExecContext describes one semantic batch.
@@ -48,6 +53,19 @@ func newBatchExecContext(ctx context.Context, query string, batchArgs [][]any) (
 		return nil, errEmptyBatchQuery
 	}
 
+	if len(batchArgs) > 1 {
+		expectedArgCount := len(batchArgs[0])
+
+		for i := 1; i < len(batchArgs); i++ {
+			if len(batchArgs[i]) != expectedArgCount {
+				return nil, fmt.Errorf(
+					"%w: batch item %d has %d arguments, expected %d",
+					errInconsistentBatchArgs, i, len(batchArgs[i]), expectedArgCount,
+				)
+			}
+		}
+	}
+
 	return &batchExecContext{query: query, batchArgs: batchArgs}, nil
 }
 
@@ -56,6 +74,11 @@ func newBatchExecContext(ctx context.Context, query string, batchArgs [][]any) (
 // The transaction is owned by this function.
 // All batch items are executed sequentially in one local transaction.
 // The first execution error stops the batch and causes the whole transaction to be rolled back.
+//
+// When used a Seata AT driver in a global transaction, all batch items
+// participate in the same local transaction and therefore share the same AT
+// branch lifecycle. AT-specific image and undo-log handling remains the
+// responsibility of the Seata driver and its executors.
 //
 // This is the batch counterpart of database/sql.DB.ExecContext:
 // when callers need to combine the batch with other statements in the same transaction,
@@ -97,6 +120,9 @@ func ExecBatchContext(ctx context.Context, db *gosql.DB, query string, batchArgs
 
 // ExecBatchInTxContext executes one SQL template with multiple argument groups
 // inside a caller-owned transaction.
+//
+// When used with a Seata AT driver, the batch joins the caller's existing transaction
+// and doesn't create or finish an AT branch on its own.
 //
 // The function never commits or rolls back tx.
 // If an item fails, execution stops immediately and the error is returned to the caller,

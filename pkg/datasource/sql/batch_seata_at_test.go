@@ -34,7 +34,7 @@ import (
 	"seata.apache.org/seata-go/v2/pkg/tm"
 )
 
-func newBatchATTestDB(t *testing.T,
+func newBatchSeataATTestDB(t *testing.T,
 	ctrl *gomock.Controller,
 ) (*gosql.DB, *mock.MockTestDriverConn, *mock.MockTestDriverTx) {
 	t.Helper()
@@ -74,11 +74,11 @@ func newBatchATTestDB(t *testing.T,
 	return db, mockConn, mockTx
 }
 
-func TestExecBatchContextGlobalATUsesSingleLocalTransaction(t *testing.T) {
+func TestExecBatchContextWithSeataATDriverUsesSingleLocalTransaction(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	db, mockConn, mockTx := newBatchATTestDB(t, ctrl)
+	db, mockConn, mockTx := newBatchSeataATTestDB(t, ctrl)
 	defer db.Close()
 
 	ctx := tm.InitSeataContext(context.Background())
@@ -87,7 +87,7 @@ func TestExecBatchContextGlobalATUsesSingleLocalTransaction(t *testing.T) {
 	query := "SELECT ?"
 	var executedArgs []any
 
-	// The whole batch must create exactly one local transaction
+	// The whole batch must create exactly one local transaction.
 	mockConn.EXPECT().BeginTx(gomock.Any(), gomock.Any()).Times(1).Return(mockTx, nil)
 	mockConn.EXPECT().ExecContext(gomock.Any(), query, gomock.Any()).Times(3).DoAndReturn(func(
 		ctx context.Context, query string, args []driver.NamedValue,
@@ -97,7 +97,7 @@ func TestExecBatchContextGlobalATUsesSingleLocalTransaction(t *testing.T) {
 		return driver.ResultNoRows, nil
 	})
 
-	// All items belong to the same transaction,so commit only once
+	// All items belong to the same transaction,so commit only once.
 	mockTx.EXPECT().Commit().Times(1).Return(nil)
 	err := ExecBatchContext(ctx, db, query, [][]any{{"item0"}, {"item1"}, {"item2"}})
 
@@ -105,11 +105,11 @@ func TestExecBatchContextGlobalATUsesSingleLocalTransaction(t *testing.T) {
 	require.Equal(t, []any{"item0", "item1", "item2"}, executedArgs)
 }
 
-func TestExecBatchContextGlobalATRollbackOwnedTransactionOnFailure(t *testing.T) {
+func TestExecBatchContextWithSeataATDriverRollsBackOwnedTransactionOnFailure(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	db, mockConn, mockTx := newBatchATTestDB(t, ctrl)
+	db, mockConn, mockTx := newBatchSeataATTestDB(t, ctrl)
 	defer db.Close()
 
 	ctx := tm.InitSeataContext(context.Background())
@@ -140,11 +140,11 @@ func TestExecBatchContextGlobalATRollbackOwnedTransactionOnFailure(t *testing.T)
 	require.Equal(t, int32(2), atomic.LoadInt32(&execCount))
 }
 
-func TestExecBatchInTxContextAllowsFollowingExecInSameTransaction(t *testing.T) {
+func TestExecBatchInTxContextWithSeataATDriverAllowsFollowingExecInSameTransaction(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	db, mockConn, mockTx := newBatchATTestDB(t, ctrl)
+	db, mockConn, mockTx := newBatchSeataATTestDB(t, ctrl)
 	defer db.Close()
 
 	ctx := tm.InitSeataContext(context.Background())

@@ -27,6 +27,23 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestExecBatchContextRejectsInconsistentArgumentCount(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	ctx := context.Background()
+	query := "UPDATE user SET name = ? WHERE id = ?"
+
+	err = ExecBatchContext(ctx, db, query, [][]any{{"user1", 1}, {"user2"}, {"user3", 3}})
+
+	require.ErrorIs(t, err, errInconsistentBatchArgs)
+	require.Contains(t, err.Error(), "batch item 1")
+	require.Contains(t, err.Error(), "has 1 arguments, expected 2")
+
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
 func TestExecBatchContextCommitOnSuccess(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	require.NoError(t, err)
