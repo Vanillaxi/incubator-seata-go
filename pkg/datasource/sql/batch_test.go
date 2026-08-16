@@ -19,6 +19,7 @@ package sql
 
 import (
 	"context"
+	"database/sql/driver"
 	"errors"
 	"regexp"
 	"testing"
@@ -26,6 +27,12 @@ import (
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/stretchr/testify/require"
 )
+
+type panickingBatchValuer struct{}
+
+func (panickingBatchValuer) Value() (driver.Value, error) {
+	panic("batch valuer panic")
+}
 
 func TestExecBatchContextRejectsInconsistentArgumentCount(t *testing.T) {
 	db, mock, err := sqlmock.New()
@@ -35,11 +42,13 @@ func TestExecBatchContextRejectsInconsistentArgumentCount(t *testing.T) {
 	ctx := context.Background()
 	query := "UPDATE user SET name = ? WHERE id = ?"
 
-	err = ExecBatchContext(ctx, db, query, [][]any{{"user1", 1}, {"user2"}, {"user3", 3}})
+	result, err := ExecBatchContext(ctx, db, query, [][]any{{"user1", 1}, {"user2"}, {"user3", 3}})
 
 	require.ErrorIs(t, err, errInconsistentBatchArgs)
 	require.Contains(t, err.Error(), "batch item 1")
 	require.Contains(t, err.Error(), "has 1 arguments, expected 2")
+	require.Equal(t, BatchPhaseValidate, result.Outcome.FailurePhase)
+	require.Equal(t, BatchTransactionNotStarted, result.Outcome.TransactionState)
 
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -51,25 +60,45 @@ func TestExecBatchContextCommitOnSuccess(t *testing.T) {
 
 	ctx := context.Background()
 	query := "UPDATE user SET name = ? WHERE id = ?"
+	metadataErr := errors.New("result metadata unavailable")
 
 	mock.ExpectBegin()
 
 	mock.ExpectExec(regexp.QuoteMeta(query)).
 		WithArgs("user1", 1).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnResult(sqlmock.NewResult(10, 1))
 
 	mock.ExpectExec(regexp.QuoteMeta(query)).
 		WithArgs("user2", 2).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnResult(sqlmock.NewResult(20, 2))
 
 	mock.ExpectExec(regexp.QuoteMeta(query)).
 		WithArgs("user3", 3).
-		WillReturnResult(sqlmock.NewResult(0, 1))
+		WillReturnResult(sqlmock.NewErrorResult(metadataErr))
 
 	mock.ExpectCommit()
 
-	err = ExecBatchContext(ctx, db, query, [][]any{{"user1", 1}, {"user2", 2}, {"user3", 3}})
+	result, err := ExecBatchContext(ctx, db, query, [][]any{{"user1", 1}, {"user2", 2}, {"user3", 3}})
 	require.NoError(t, err)
+	require.Equal(t, BatchTransactionCommitted, result.Outcome.TransactionState)
+	require.Equal(t, NoFailedBatchItem, result.Outcome.FailedIndex)
+	require.Len(t, result.Items, 3)
+
+	for i := range result.Items {
+		require.Equal(t, i, result.Items[i].Index)
+		require.Equal(t, BatchItemExecuted, result.Items[i].State)
+	}
+
+	lastInsertID, err := result.Items[0].LastInsertId()
+	require.NoError(t, err)
+	require.EqualValues(t, 10, lastInsertID)
+	rowsAffected, err := result.Items[1].RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 2, rowsAffected)
+	_, err = result.Items[2].LastInsertId()
+	require.ErrorIs(t, err, metadataErr)
+	_, err = result.Items[2].RowsAffected()
+	require.ErrorIs(t, err, metadataErr)
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -94,11 +123,88 @@ func TestExecBatchContextRollbackOnItemFailure(t *testing.T) {
 
 	mock.ExpectRollback()
 
-	err = ExecBatchContext(ctx, db, query, [][]any{{"user1", 1}, {"user2", 2}, {"user3", 3}})
+	result, err := ExecBatchContext(ctx, db, query, [][]any{{"user1", 1}, {"user2", 2}, {"user3", 3}})
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, execErr)
 	require.Contains(t, err.Error(), "batch item 1")
+	require.Equal(t, BatchOutcome{
+		FailedIndex:      1,
+		FailurePhase:     BatchPhaseExecute,
+		TransactionState: BatchTransactionRolledBack,
+	}, result.Outcome)
+	require.Equal(t, BatchItemExecuted, result.Items[0].State)
+	require.Equal(t, BatchItemFailed, result.Items[1].State)
+	require.Equal(t, BatchItemNotExecuted, result.Items[2].State)
+	require.ErrorIs(t, result.Items[1].Err(), execErr)
+	rowsAffected, resultErr := result.Items[0].RowsAffected()
+	require.NoError(t, resultErr)
+	require.EqualValues(t, 1, rowsAffected)
+
+	var batchErr *BatchError
+	require.ErrorAs(t, err, &batchErr)
+	require.Equal(t, result.Outcome, batchErr.Outcome)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestExecBatchContextReportsRollbackFailure(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	execErr := errors.New("execute failed")
+	rollbackErr := errors.New("rollback failed")
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE").WillReturnError(execErr)
+	mock.ExpectRollback().WillReturnError(rollbackErr)
+
+	result, err := ExecBatchContext(context.Background(), db, "UPDATE", [][]any{{}})
+
+	require.ErrorIs(t, err, execErr)
+	require.ErrorIs(t, err, rollbackErr)
+	require.Equal(t, BatchTransactionRollbackFailed, result.Outcome.TransactionState)
+	require.Equal(t, 0, result.Outcome.FailedIndex)
+
+	var batchErr *BatchError
+	require.ErrorAs(t, err, &batchErr)
+	require.ErrorIs(t, batchErr.RollbackErr, rollbackErr)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestExecBatchContextPreservesResultsWhenCommitOutcomeUnknown(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	commitErr := errors.New("commit failed")
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE").WillReturnResult(sqlmock.NewResult(10, 2))
+	mock.ExpectCommit().WillReturnError(commitErr)
+
+	result, err := ExecBatchContext(context.Background(), db, "UPDATE", [][]any{{}})
+
+	require.ErrorIs(t, err, commitErr)
+	require.Equal(t, BatchPhaseCommit, result.Outcome.FailurePhase)
+	require.Equal(t, BatchTransactionCommitUnknown, result.Outcome.TransactionState)
+	require.Equal(t, NoFailedBatchItem, result.Outcome.FailedIndex)
+	require.Equal(t, BatchItemExecuted, result.Items[0].State)
+	rowsAffected, resultErr := result.Items[0].RowsAffected()
+	require.NoError(t, resultErr)
+	require.EqualValues(t, 2, rowsAffected)
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestExecBatchContextRollsBackWhenExecutionPanics(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	require.NoError(t, err)
+	defer db.Close()
+
+	mock.ExpectBegin()
+	mock.ExpectRollback()
+
+	require.PanicsWithValue(t, "batch valuer panic", func() {
+		_, _ = ExecBatchContext(context.Background(), db, "UPDATE", [][]any{{panickingBatchValuer{}}})
+	})
 	require.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -123,8 +229,11 @@ func TestExecBatchInTxContextKeepsCallerTransactionOpen(t *testing.T) {
 		WithArgs("user2", 2).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	err = ExecBatchInTxContext(ctx, tx, batchQuery, [][]any{{"user1", 1}, {"user2", 2}})
+	result, err := ExecBatchInTxContext(ctx, tx, batchQuery, [][]any{{"user1", 1}, {"user2", 2}})
 	require.NoError(t, err)
+	require.Equal(t, BatchTransactionPending, result.Outcome.TransactionState)
+	require.Equal(t, BatchItemExecuted, result.Items[0].State)
+	require.Equal(t, BatchItemExecuted, result.Items[1].State)
 
 	// If the batch API committed the transaction internally,this statement would fail with sql.ErrTxDone
 	mock.ExpectExec(regexp.QuoteMeta(singleQuery)).
@@ -160,8 +269,12 @@ func TestExecBatchInTxContextDoesNotRollbackCallerTransaction(t *testing.T) {
 		WithArgs("user2", 2).
 		WillReturnError(execErr)
 
-	err = ExecBatchInTxContext(ctx, tx, query, [][]any{{"user1", 1}, {"user2", 2}})
+	result, err := ExecBatchInTxContext(ctx, tx, query, [][]any{{"user1", 1}, {"user2", 2}})
 	require.ErrorIs(t, err, execErr)
+	require.Equal(t, BatchTransactionPending, result.Outcome.TransactionState)
+	require.Equal(t, 1, result.Outcome.FailedIndex)
+	require.Equal(t, BatchItemExecuted, result.Items[0].State)
+	require.Equal(t, BatchItemFailed, result.Items[1].State)
 
 	// The caller still owns the transaction
 	mock.ExpectRollback()
@@ -175,8 +288,10 @@ func TestExecBatchContextEmptyBatchIsNoop(t *testing.T) {
 	require.NoError(t, err)
 	defer db.Close()
 
-	err = ExecBatchContext(context.Background(), db, "UPDATE user SET name = ? WHERE id = ?", nil)
+	result, err := ExecBatchContext(context.Background(), db, "UPDATE user SET name = ? WHERE id = ?", nil)
 	require.NoError(t, err)
+	require.Empty(t, result.Items)
+	require.Equal(t, BatchTransactionNotStarted, result.Outcome.TransactionState)
 	// No Begin/Exec/Commit should happen.
 	require.NoError(t, mock.ExpectationsWereMet())
 }
@@ -197,7 +312,7 @@ func TestExecBatchContextDoesNotLeakStateAfterFailure(t *testing.T) {
 	mock.ExpectExec(regexp.QuoteMeta(query)).WithArgs("usera2", 2).WillReturnError(firstBatchErr)
 	mock.ExpectRollback()
 
-	err = ExecBatchContext(ctx, db, query, [][]any{{"usera1", 1}, {"usera2", 2}})
+	_, err = ExecBatchContext(ctx, db, query, [][]any{{"usera1", 1}, {"usera2", 2}})
 	require.ErrorIs(t, err, firstBatchErr)
 
 	// Batch B.
@@ -207,7 +322,7 @@ func TestExecBatchContextDoesNotLeakStateAfterFailure(t *testing.T) {
 
 	mock.ExpectCommit()
 
-	err = ExecBatchContext(ctx, db, query, [][]any{{"userb1", 3}, {"userb2", 4}})
+	_, err = ExecBatchContext(ctx, db, query, [][]any{{"userb1", 3}, {"userb2", 4}})
 
 	require.NoError(t, err)
 	require.NoError(t, mock.ExpectationsWereMet())

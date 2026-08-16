@@ -74,8 +74,9 @@ func newBatchExecContext(ctx context.Context, query string, batchArgs [][]any) (
 // The transaction is owned by this function.
 // All batch items are executed sequentially in one local transaction.
 // The first execution error stops the batch and causes the whole transaction to be rolled back.
+// The returned result remains valid on error and contains one ordered item for each argument group.
 //
-// When used a Seata AT driver in a global transaction, all batch items
+// When used with a Seata AT driver in a global transaction, all batch items
 // participate in the same local transaction and therefore share the same AT
 // branch lifecycle. AT-specific image and undo-log handling remains the
 // responsibility of the Seata driver and its executors.
@@ -83,39 +84,69 @@ func newBatchExecContext(ctx context.Context, query string, batchArgs [][]any) (
 // This is the batch counterpart of database/sql.DB.ExecContext:
 // when callers need to combine the batch with other statements in the same transaction,
 // they should begin a transaction explicitly and use ExecBatchInTxContext.
-func ExecBatchContext(ctx context.Context, db *gosql.DB, query string, batchArgs [][]any) error {
+func ExecBatchContext(ctx context.Context, db *gosql.DB, query string, batchArgs [][]any) (BatchResult, error) {
+	result := newBatchResult(len(batchArgs), BatchTransactionNotStarted)
 	if db == nil {
-		return errNilBatchDB
+		result.Outcome.FailurePhase = BatchPhaseValidate
+		return result, newBatchError(result, errNilBatchDB, nil)
 	}
 
 	batchCtx, err := newBatchExecContext(ctx, query, batchArgs)
 	if err != nil {
-		return err
+		result.Outcome.FailurePhase = BatchPhaseValidate
+		return result, newBatchError(result, err, nil)
 	}
 
 	if len(batchCtx.batchArgs) == 0 {
-		return nil
+		return result, nil
 	}
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin batch transaction: %w", err)
+		result.Outcome.FailurePhase = BatchPhaseBegin
+		cause := fmt.Errorf("begin batch transaction: %w", err)
+		return result, newBatchError(result, cause, nil)
 	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
 
 	// database/sql may already have rolled back the transaction after context cancellation.
 	// Do not let ErrTxDone hide the original execution error.
-	if err := executeBatch(ctx, tx, batchCtx); err != nil {
+	if failedIndex, err := executeBatch(ctx, tx, batchCtx, &result); err != nil {
+		result.Outcome.FailedIndex = failedIndex
+		result.Outcome.FailurePhase = BatchPhaseExecute
 		rollbackErr := tx.Rollback()
 		if rollbackErr != nil && !errors.Is(rollbackErr, gosql.ErrTxDone) {
-			return errors.Join(err, fmt.Errorf("rollback batch transaction: %w", rollbackErr))
+			result.Outcome.TransactionState = BatchTransactionRollbackFailed
+			rollbackErr = fmt.Errorf("rollback batch transaction: %w", rollbackErr)
+			return result, newBatchError(result, err, rollbackErr)
 		}
-		return err
+		result.Outcome.TransactionState = BatchTransactionRolledBack
+		return result, newBatchError(result, err, nil)
 	}
 
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit batch transaction: %w", err)
+		result.Outcome.FailurePhase = BatchPhaseCommit
+		result.Outcome.TransactionState = BatchTransactionCommitUnknown
+		var rollbackErr error
+		var commitErr *atCommitError
+		if errors.As(err, &commitErr) {
+			switch commitErr.outcome {
+			case atCommitOutcomeRolledBack:
+				result.Outcome.TransactionState = BatchTransactionRolledBack
+			case atCommitOutcomeRollbackFailed:
+				result.Outcome.TransactionState = BatchTransactionRollbackFailed
+				rollbackErr = commitErr.rollbackErr
+			case atCommitOutcomeCommitted:
+				result.Outcome.TransactionState = BatchTransactionCommitted
+			}
+		}
+		cause := fmt.Errorf("commit batch transaction: %w", err)
+		return result, newBatchError(result, cause, rollbackErr)
 	}
-	return nil
+	result.Outcome.TransactionState = BatchTransactionCommitted
+	return result, nil
 }
 
 // ExecBatchInTxContext executes one SQL template with multiple argument groups
@@ -127,21 +158,32 @@ func ExecBatchContext(ctx context.Context, db *gosql.DB, query string, batchArgs
 // The function never commits or rolls back tx.
 // If an item fails, execution stops immediately and the error is returned to the caller,
 // which remains responsible for the transaction lifecycle.
-func ExecBatchInTxContext(ctx context.Context, tx *gosql.Tx, query string, batchArgs [][]any) error {
+// The returned transaction state is pending because the caller owns its final outcome.
+func ExecBatchInTxContext(ctx context.Context, tx *gosql.Tx, query string, batchArgs [][]any) (BatchResult, error) {
+	result := newBatchResult(len(batchArgs), BatchTransactionNotStarted)
 	if tx == nil {
-		return errNilBatchTx
+		result.Outcome.FailurePhase = BatchPhaseValidate
+		return result, newBatchError(result, errNilBatchTx, nil)
 	}
+	result.Outcome.TransactionState = BatchTransactionPending
 
 	batchCtx, err := newBatchExecContext(ctx, query, batchArgs)
 	if err != nil {
-		return err
+		result.Outcome.FailurePhase = BatchPhaseValidate
+		return result, newBatchError(result, err, nil)
 	}
 
 	if len(batchCtx.batchArgs) == 0 {
-		return nil
+		return result, nil
 	}
 
-	return executeBatch(ctx, tx, batchCtx)
+	failedIndex, err := executeBatch(ctx, tx, batchCtx, &result)
+	if err != nil {
+		result.Outcome.FailedIndex = failedIndex
+		result.Outcome.FailurePhase = BatchPhaseExecute
+		return result, newBatchError(result, err, nil)
+	}
+	return result, nil
 }
 
 // executeBatch is the semantic batch execution core.
@@ -149,11 +191,15 @@ func ExecBatchInTxContext(ctx context.Context, tx *gosql.Tx, query string, batch
 // Regardless of whether the transaction was created by ExecBatchContext or
 // supplied by the caller, all items are executed on the same *sql.Tx and
 // therefore the same underlying database transaction.
-func executeBatch(ctx context.Context, tx *gosql.Tx, batchCtx *batchExecContext) error {
+func executeBatch(ctx context.Context, tx *gosql.Tx, batchCtx *batchExecContext, result *BatchResult) (int, error) {
 	for i, arg := range batchCtx.batchArgs {
-		if _, err := tx.ExecContext(ctx, batchCtx.query, arg...); err != nil {
-			return fmt.Errorf("execute batch item %d: %w", i, err)
+		sqlResult, err := tx.ExecContext(ctx, batchCtx.query, arg...)
+		if err != nil {
+			result.Items[i].State = BatchItemFailed
+			result.Items[i].execErr = err
+			return i, fmt.Errorf("execute batch item %d: %w", i, err)
 		}
+		result.Items[i].recordResult(sqlResult)
 	}
-	return nil
+	return NoFailedBatchItem, nil
 }

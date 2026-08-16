@@ -22,6 +22,8 @@ import (
 	gosql "database/sql"
 	"database/sql/driver"
 	"errors"
+	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -29,29 +31,67 @@ import (
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
+	"seata.apache.org/seata-go/v2/pkg/datasource/sql/datasource"
 	"seata.apache.org/seata-go/v2/pkg/datasource/sql/mock"
+	"seata.apache.org/seata-go/v2/pkg/datasource/sql/types"
+	"seata.apache.org/seata-go/v2/pkg/datasource/sql/undo"
+	undoparser "seata.apache.org/seata-go/v2/pkg/datasource/sql/undo/parser"
 	"seata.apache.org/seata-go/v2/pkg/protocol/branch"
+	"seata.apache.org/seata-go/v2/pkg/rm"
 	"seata.apache.org/seata-go/v2/pkg/tm"
 )
 
+type batchATRows struct {
+	columns []string
+	data    [][]driver.Value
+	index   int
+}
+
+func (r *batchATRows) Columns() []string { return r.columns }
+func (r *batchATRows) Close() error      { return nil }
+func (r *batchATRows) Next(dest []driver.Value) error {
+	if r.index == len(r.data) {
+		return io.EOF
+	}
+	copy(dest, r.data[r.index])
+	r.index++
+	return nil
+}
+
+type batchATTableCache struct{}
+
+func (batchATTableCache) Init(context.Context, *gosql.DB) error { return nil }
+func (batchATTableCache) Destroy() error                        { return nil }
+func (batchATTableCache) GetTableMeta(_ context.Context, _, table string) (*types.TableMeta, error) {
+	idColumn := types.ColumnMeta{ColumnName: "id", DatabaseTypeString: "BIGINT"}
+	return &types.TableMeta{
+		TableName:   table,
+		ColumnNames: []string{"id", "balance"},
+		Columns: map[string]types.ColumnMeta{
+			"id":      idColumn,
+			"balance": {ColumnName: "balance", DatabaseTypeString: "BIGINT"},
+		},
+		Indexs: map[string]types.IndexMeta{
+			"PRIMARY": {IType: types.IndexTypePrimaryKey, Columns: []types.ColumnMeta{idColumn}},
+		},
+	}, nil
+}
+
 func newBatchSeataATTestDB(t *testing.T,
 	ctrl *gomock.Controller,
-) (*gosql.DB, *mock.MockTestDriverConn, *mock.MockTestDriverTx) {
+) (*gosql.DB, *mock.MockTestDriverConn, *mock.MockTestDriverTx, *mock.MockDataSourceManager) {
 	t.Helper()
 
-	_ = initMockResourceManager(branch.BranchTypeAT, ctrl)
-
-	db, err := gosql.Open(
-		SeataATMySQLDriver,
-		"root:12345678@tcp(127.0.0.1:3306)/seata_client?multiStatements=true",
-	)
-	require.NoError(t, err)
+	mockMgr := mock.NewMockDataSourceManager(ctrl)
+	mockMgr.SetBranchType(branch.BranchTypeAT)
+	mockMgr.EXPECT().RegisterResource(gomock.Any()).Times(1).Return(nil)
+	registerResourceManagerForTest(t, mockMgr)
 
 	mockTx := mock.NewMockTestDriverTx(ctrl)
 	mockConn := mock.NewMockTestDriverConn(ctrl)
 
 	mockConn.EXPECT().
-		QueryContext(gomock.Any(), gomock.Any(), gomock.Any()).
+		QueryContext(gomock.Any(), "SELECT VERSION()", gomock.Any()).
 		AnyTimes().
 		DoAndReturn(func(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 			rows := &mysqlMockRows{}
@@ -67,84 +107,263 @@ func newBatchSeataATTestDB(t *testing.T,
 	connector := mock.NewMockTestDriverConnector(ctrl)
 	connector.EXPECT().Connect(gomock.Any()).AnyTimes().Return(mockConn, nil)
 
-	_ = initMockAtConnector(t, ctrl, db, func(t *testing.T, ctrl *gomock.Controller) driver.Connector {
-		return connector
+	targetDB := gosql.OpenDB(connector)
+	t.Cleanup(func() {
+		_ = targetDB.Close()
 	})
 
-	return db, mockConn, mockTx
+	previousTableCache := datasource.GetTableCache(types.DBTypeMySQL)
+	t.Cleanup(func() {
+		datasource.RegisterTableCache(types.DBTypeMySQL, previousTableCache)
+	})
+
+	proxyConnector, err := (&seataDriver{
+		branchType: branch.BranchTypeAT,
+		transType:  types.ATMode,
+		descriptor: mySQLDriverDescriptor,
+		target:     mySQLDriverDescriptor.target,
+		targetName: "mysql",
+	}).getOpenConnectorProxy(
+		connector,
+		types.DBTypeMySQL,
+		targetDB,
+		"root:password@tcp(mock:3306)/seata_client?multiStatements=true",
+	)
+	require.NoError(t, err)
+
+	baseConnector, ok := proxyConnector.(*seataConnector)
+	require.True(t, ok)
+	db := gosql.OpenDB(&seataATConnector{seataConnector: baseConnector})
+
+	return db, mockConn, mockTx, mockMgr
 }
 
-func TestExecBatchContextWithSeataATDriverUsesSingleLocalTransaction(t *testing.T) {
+func expectBatchATImageQueries(t *testing.T, mockConn *mock.MockTestDriverConn, snapshots [][]driver.Value) {
+	t.Helper()
+
+	callIndex := 0
+	mockConn.EXPECT().QueryContext(gomock.Any(), gomock.Not("SELECT VERSION()"), gomock.Any()).
+		Times(len(snapshots)).DoAndReturn(func(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+		require.Len(t, args, 1)
+		require.Equal(t, snapshots[callIndex][0], args[0].Value)
+		if callIndex%2 == 0 {
+			require.Contains(t, query, "FOR UPDATE")
+		} else {
+			require.NotContains(t, query, "FOR UPDATE")
+		}
+		rows := &batchATRows{columns: []string{"id", "balance"}, data: [][]driver.Value{snapshots[callIndex]}}
+		callIndex++
+		return rows, nil
+	})
+}
+
+func TestExecBatchContextWithSeataATDriverUsesSingleBranchLifecycle(t *testing.T) {
+	CleanTxHooks()
+	t.Cleanup(CleanTxHooks)
+
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	db, mockConn, mockTx := newBatchSeataATTestDB(t, ctrl)
+	db, mockConn, mockTx, mockMgr := newBatchSeataATTestDB(t, ctrl)
 	defer db.Close()
+	datasource.RegisterTableCache(types.DBTypeMySQL, batchATTableCache{})
+
+	previousUndoConfig := undo.UndoConfig
+	undo.UndoConfig = undo.Config{LogSerialization: "json", LogTable: "undo_log"}
+	t.Cleanup(func() { undo.UndoConfig = previousUndoConfig })
 
 	ctx := tm.InitSeataContext(context.Background())
-	tm.SetXID(ctx, uuid.NewString())
+	xid := uuid.NewString()
+	tm.SetXID(ctx, xid)
 
-	query := "SELECT ?"
-	var executedArgs []any
+	query := "UPDATE account SET balance = ? WHERE id = ?"
+	var txCtx *types.TransactionContext
+	RegisterTxHook(&mockTxHook{beforeCommit: func(tx *Tx) error {
+		txCtx = tx.tranCtx
+		return nil
+	}})
 
-	// The whole batch must create exactly one local transaction.
 	mockConn.EXPECT().BeginTx(gomock.Any(), gomock.Any()).Times(1).Return(mockTx, nil)
-	mockConn.EXPECT().ExecContext(gomock.Any(), query, gomock.Any()).Times(3).DoAndReturn(func(
-		ctx context.Context, query string, args []driver.NamedValue,
-	) (driver.Result, error) {
-		require.Len(t, args, 1)
-		executedArgs = append(executedArgs, args[0].Value)
-		return driver.ResultNoRows, nil
+	expectBatchATImageQueries(t, mockConn, [][]driver.Value{
+		{int64(1), int64(100)}, {int64(1), int64(110)},
+		{int64(2), int64(200)}, {int64(2), int64(220)},
 	})
+	mockConn.EXPECT().ExecContext(gomock.Any(), query, gomock.Any()).Times(2).DoAndReturn(
+		func(_ context.Context, _ string, args []driver.NamedValue) (driver.Result, error) {
+			require.Len(t, args, 2)
+			return driver.RowsAffected(1), nil
+		},
+	)
 
-	// All items belong to the same transaction,so commit only once.
-	mockTx.EXPECT().Commit().Times(1).Return(nil)
-	err := ExecBatchContext(ctx, db, query, [][]any{{"item0"}, {"item1"}, {"item2"}})
+	const branchID = int64(123)
+	var registeredLockKeys []string
+	registerCall := mockMgr.EXPECT().BranchRegister(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+		func(_ context.Context, param rm.BranchRegisterParam) (int64, error) {
+			require.Equal(t, xid, param.Xid)
+			registeredLockKeys = strings.FieldsFunc(param.LockKeys, func(r rune) bool { return r == ';' })
+			return branchID, nil
+		},
+	)
+
+	undoStmt := mock.NewMockTestDriverStmt(ctrl)
+	prepareUndoCall := mockConn.EXPECT().PrepareContext(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+		func(_ context.Context, query string) (driver.Stmt, error) {
+			require.Contains(t, query, "INSERT INTO undo_log")
+			return undoStmt, nil
+		},
+	)
+	undoStmt.EXPECT().Close().Times(1).Return(nil)
+	var branchUndoLog *undo.BranchUndoLog
+	flushUndoCall := undoStmt.EXPECT().ExecContext(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+		func(_ context.Context, args []driver.NamedValue) (driver.Result, error) {
+			require.Len(t, args, 5)
+			require.EqualValues(t, branchID, args[0].Value)
+			require.Equal(t, xid, args[1].Value)
+			rollbackInfo, ok := args[3].Value.([]byte)
+			require.True(t, ok)
+			var err error
+			branchUndoLog, err = (&undoparser.JsonParser{}).Decode(rollbackInfo)
+			require.NoError(t, err)
+			return driver.ResultNoRows, nil
+		},
+	)
+
+	commitCall := mockTx.EXPECT().Commit().Times(1).Return(nil)
+	reportCall := mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).Times(1).DoAndReturn(
+		func(_ context.Context, param rm.BranchReportParam) error {
+			require.EqualValues(t, branchID, param.BranchId)
+			require.EqualValues(t, branch.BranchStatusPhaseoneDone, param.Status)
+			return nil
+		},
+	)
+	gomock.InOrder(registerCall, prepareUndoCall, flushUndoCall, commitCall, reportCall)
+
+	result, err := ExecBatchContext(ctx, db, query, [][]any{{int64(110), int64(1)}, {int64(220), int64(2)}})
 
 	require.NoError(t, err)
-	require.Equal(t, []any{"item0", "item1", "item2"}, executedArgs)
+	require.Equal(t, BatchTransactionCommitted, result.Outcome.TransactionState)
+	require.NotNil(t, txCtx)
+	require.Len(t, txCtx.RoundImages.BeofreImages(), 2)
+	require.Len(t, txCtx.RoundImages.AfterImages(), 2)
+
+	lockKeys := make([]string, 0, len(txCtx.LockKeys))
+	for lockKey := range txCtx.LockKeys {
+		lockKeys = append(lockKeys, lockKey)
+	}
+	require.ElementsMatch(t, []string{"ACCOUNT:1", "ACCOUNT:2"}, lockKeys)
+	require.ElementsMatch(t, lockKeys, registeredLockKeys)
+
+	require.NotNil(t, branchUndoLog)
+	require.Equal(t, xid, branchUndoLog.Xid)
+	require.EqualValues(t, branchID, branchUndoLog.BranchID)
+	require.Len(t, branchUndoLog.Logs, 2)
+	for i, expectedID := range []int64{1, 2} {
+		require.EqualValues(t, expectedID, branchUndoLog.Logs[i].BeforeImage.Rows[0].GetColumnMap()["id"].Value)
+		require.EqualValues(t, expectedID, branchUndoLog.Logs[i].AfterImage.Rows[0].GetColumnMap()["id"].Value)
+	}
 }
 
 func TestExecBatchContextWithSeataATDriverRollsBackOwnedTransactionOnFailure(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	db, mockConn, mockTx := newBatchSeataATTestDB(t, ctrl)
+	db, mockConn, mockTx, mockMgr := newBatchSeataATTestDB(t, ctrl)
 	defer db.Close()
+	datasource.RegisterTableCache(types.DBTypeMySQL, batchATTableCache{})
 
 	ctx := tm.InitSeataContext(context.Background())
 	tm.SetXID(ctx, uuid.NewString())
 
-	query := "SELECT ?"
+	query := "UPDATE account SET balance = ? WHERE id = ?"
 	execErr := errors.New("execute failed")
 
 	var execCount int32
 	mockConn.EXPECT().BeginTx(gomock.Any(), gomock.Any()).Times(1).Return(mockTx, nil)
+	expectBatchATImageQueries(t, mockConn, [][]driver.Value{
+		{int64(1), int64(100)}, {int64(1), int64(110)}, {int64(2), int64(200)},
+	})
 	mockConn.EXPECT().ExecContext(gomock.Any(), query, gomock.Any()).
-		Times(2).DoAndReturn(func(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+		Times(2).DoAndReturn(func(_ context.Context, _ string, args []driver.NamedValue) (driver.Result, error) {
 		count := atomic.AddInt32(&execCount, 1)
 		if count == 2 {
 			return nil, execErr
 		}
-		return driver.ResultNoRows, nil
+		return driver.RowsAffected(1), nil
 	})
 
+	mockMgr.EXPECT().BranchRegister(gomock.Any(), gomock.Any()).Times(0)
+	mockMgr.EXPECT().BranchReport(gomock.Any(), gomock.Any()).Times(0)
+	mockConn.EXPECT().PrepareContext(gomock.Any(), gomock.Any()).Times(0)
+	mockTx.EXPECT().Commit().Times(0)
 	mockTx.EXPECT().Rollback().Times(1).Return(nil)
-	err := ExecBatchContext(ctx, db, query, [][]any{{"item0"}, {"item1"}, {"item2"}})
+	result, err := ExecBatchContext(ctx, db, query, [][]any{
+		{int64(110), int64(1)}, {int64(220), int64(2)}, {int64(330), int64(3)},
+	})
 
 	require.Error(t, err)
 	require.ErrorIs(t, err, execErr)
 	require.Contains(t, err.Error(), "batch item 1")
+	require.Equal(t, BatchItemExecuted, result.Items[0].State)
+	require.Equal(t, BatchItemFailed, result.Items[1].State)
+	require.Equal(t, BatchItemNotExecuted, result.Items[2].State)
 
 	// item2 must never execute
 	require.Equal(t, int32(2), atomic.LoadInt32(&execCount))
+}
+
+func TestExecBatchContextMapsATPreCommitOutcome(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		rollbackErr   error
+		expectedState BatchTransactionState
+	}{
+		{name: "rolled back", expectedState: BatchTransactionRolledBack},
+		{name: "rollback failed", rollbackErr: errors.New("rollback failed"), expectedState: BatchTransactionRollbackFailed},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			CleanTxHooks()
+			t.Cleanup(CleanTxHooks)
+
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			db, mockConn, mockTx, _ := newBatchSeataATTestDB(t, ctrl)
+			defer db.Close()
+
+			commitErr := errors.New("before commit failed")
+			RegisterTxHook(&mockTxHook{beforeCommit: func(*Tx) error { return commitErr }})
+
+			mockConn.EXPECT().BeginTx(gomock.Any(), gomock.Any()).Times(1).Return(mockTx, nil)
+			mockConn.EXPECT().ExecContext(gomock.Any(), "SELECT ?", gomock.Any()).Times(1).Return(driver.ResultNoRows, nil)
+			mockTx.EXPECT().Rollback().Times(1).Return(test.rollbackErr)
+
+			ctx := tm.InitSeataContext(context.Background())
+			tm.SetXID(ctx, uuid.NewString())
+			result, err := ExecBatchContext(ctx, db, "SELECT ?", [][]any{{"item0"}})
+
+			require.ErrorIs(t, err, commitErr)
+			require.Equal(t, BatchPhaseCommit, result.Outcome.FailurePhase)
+			require.Equal(t, NoFailedBatchItem, result.Outcome.FailedIndex)
+			require.Equal(t, test.expectedState, result.Outcome.TransactionState)
+			require.Equal(t, BatchItemExecuted, result.Items[0].State)
+
+			var batchErr *BatchError
+			require.ErrorAs(t, err, &batchErr)
+			if test.rollbackErr == nil {
+				require.NoError(t, batchErr.RollbackErr)
+			} else {
+				require.ErrorIs(t, err, test.rollbackErr)
+				require.ErrorIs(t, batchErr.RollbackErr, test.rollbackErr)
+			}
+		})
+	}
 }
 
 func TestExecBatchInTxContextWithSeataATDriverAllowsFollowingExecInSameTransaction(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
-	db, mockConn, mockTx := newBatchSeataATTestDB(t, ctrl)
+	db, mockConn, mockTx, _ := newBatchSeataATTestDB(t, ctrl)
 	defer db.Close()
 
 	ctx := tm.InitSeataContext(context.Background())
@@ -170,7 +389,7 @@ func TestExecBatchInTxContextWithSeataATDriverAllowsFollowingExecInSameTransacti
 
 	tx, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
-	err = ExecBatchInTxContext(ctx, tx, batchQuery, [][]any{{"item0"}, {"item1"}})
+	_, err = ExecBatchInTxContext(ctx, tx, batchQuery, [][]any{{"item0"}, {"item1"}})
 	require.NoError(t, err)
 
 	// Batch execution must not close caller-owned transaction

@@ -36,6 +36,17 @@ type rowsWithStmt struct {
 	stmt driver.Stmt
 }
 
+// nonRetryableATError preserves the commit error without exposing the retry signal to database/sql.
+type nonRetryableATError struct{ cause error }
+
+func (e nonRetryableATError) Error() string { return e.cause.Error() }
+
+func (e nonRetryableATError) Is(target error) bool {
+	return target != driver.ErrBadConn && errors.Is(e.cause, target)
+}
+
+func (e nonRetryableATError) As(target any) bool { return errors.As(e.cause, target) }
+
 func (r *rowsWithStmt) Close() error {
 	rowsErr := r.Rows.Close()
 	stmtErr := r.stmt.Close()
@@ -261,6 +272,9 @@ func (c *ATConn) createTxAndExecIfNeeded(ctx context.Context, f func() (types.Ex
 	// For ExecContext, commit the transaction if it was created
 	if tx != nil {
 		if err := tx.Commit(); err != nil {
+			if errors.Is(err, driver.ErrBadConn) {
+				return nil, nonRetryableATError{cause: err}
+			}
 			return nil, err
 		}
 	}
